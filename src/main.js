@@ -11,6 +11,7 @@ const startBtn = document.getElementById('startBtn');
 
 const scoreEl = document.getElementById('score');
 const highScoreEl = document.getElementById('highScore');
+const hpEl = document.getElementById('hp');
 const weaponEl = document.getElementById('weapon');
 const fpsEl = document.getElementById('fps');
 
@@ -18,54 +19,464 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 
 // -----------------
-// Audio (simple synth)
+// Audio (synth: richer SFX + engine hum)
 // -----------------
 const AudioCtx = window.AudioContext || window.webkitAudioContext;
 let audioCtx = null;
 
+let masterGain = null;
+let masterComp = null;
+let sfxGain = null;
+let sfxVerb = null;
+let sfxVerbSend = null;
+let engineGain = null;
+let engineState = null;
+let musicGain = null;
+let musicState = null;
+
+function initAudioGraph() {
+  if (!audioCtx) return;
+  if (masterGain) return;
+
+  masterGain = audioCtx.createGain();
+  // Default levels. If audio feels faint on your setup, this is the first knob.
+  masterGain.gain.value = 1.45;
+
+  // Helps keep peaks pleasant while still punchy.
+  masterComp = audioCtx.createDynamicsCompressor();
+  masterComp.threshold.value = -18;
+  masterComp.knee.value = 20;
+  masterComp.ratio.value = 4;
+  masterComp.attack.value = 0.004;
+  masterComp.release.value = 0.11;
+
+  sfxGain = audioCtx.createGain();
+  sfxGain.gain.value = 1.35;
+
+  engineGain = audioCtx.createGain();
+  engineGain.gain.value = 0.0;
+
+  musicGain = audioCtx.createGain();
+  musicGain.gain.value = 0.34;
+
+  // Lightweight synthetic reverb (generated impulse response).
+  sfxVerb = audioCtx.createConvolver();
+  sfxVerb.buffer = createImpulseResponse(1.25, 2.6);
+  sfxVerbSend = audioCtx.createGain();
+  sfxVerbSend.gain.value = 0.18;
+
+  // Route: (SFX dry + SFX verb + engine) -> master -> compressor -> speakers
+  sfxGain.connect(masterGain);
+  sfxGain.connect(sfxVerbSend);
+  sfxVerbSend.connect(sfxVerb);
+  sfxVerb.connect(masterGain);
+
+  engineGain.connect(masterGain);
+  musicGain.connect(masterGain);
+
+  masterGain.connect(masterComp);
+  masterComp.connect(audioCtx.destination);
+}
+
 function ensureAudio() {
   if (!audioCtx) audioCtx = new AudioCtx();
+  initAudioGraph();
   if (audioCtx.state === 'suspended') audioCtx.resume();
 }
 
-function beep({ type = 'sine', freq = 440, dur = 0.08, gain = 0.05, detune = 0 } = {}) {
-  if (!audioCtx) return;
-  const t0 = audioCtx.currentTime;
-  const o = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-  o.type = type;
-  o.frequency.setValueAtTime(freq, t0);
-  o.detune.setValueAtTime(detune, t0);
-  g.gain.setValueAtTime(0.0001, t0);
-  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-  o.connect(g).connect(audioCtx.destination);
-  o.start(t0);
-  o.stop(t0 + dur + 0.01);
+function createImpulseResponse(seconds = 1.0, decay = 2.0) {
+  const rate = audioCtx.sampleRate;
+  const length = Math.floor(rate * seconds);
+  const impulse = audioCtx.createBuffer(2, length, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = impulse.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      const t = i / length;
+      const env = Math.pow(1 - t, decay);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+  }
+  return impulse;
 }
 
-function noiseBurst({ dur = 0.08, gain = 0.06 } = {}) {
+function connectToSfx(node) {
+  if (!audioCtx) return;
+  initAudioGraph();
+  node.connect(sfxGain);
+}
+
+function connectToMusic(node) {
+  if (!audioCtx) return;
+  initAudioGraph();
+  node.connect(musicGain);
+}
+
+function midiToFreq(m) {
+  return 440 * Math.pow(2, (m - 69) / 12);
+}
+
+function playMusicTone({ type = 'square', midi = 60, dur = 0.12, gain = 0.04, pan = 0.0, t = null } = {}) {
+  if (!audioCtx) return;
+  const t0 = t ?? audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  const p = audioCtx.createStereoPanner();
+
+  o.type = type;
+  o.frequency.setValueAtTime(midiToFreq(midi), t0);
+
+  // Snappy 8-bit envelope.
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.004);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + Math.max(0.02, dur));
+
+  p.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+
+  o.connect(g).connect(p);
+  connectToMusic(p);
+  o.start(t0);
+  o.stop(t0 + dur + 0.02);
+}
+
+function playMusicDrum({ kind = 'hat', t = null, gain = 0.03 } = {}) {
+  if (!audioCtx) return;
+  const t0 = t ?? audioCtx.currentTime;
+  const dur = kind === 'hat' ? 0.035 : kind === 'snare' ? 0.08 : 0.11;
+  const bufferSize = Math.floor(audioCtx.sampleRate * dur);
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    const env = 1 - i / bufferSize;
+    data[i] = (Math.random() * 2 - 1) * env;
+  }
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+
+  const hpf = audioCtx.createBiquadFilter();
+  hpf.type = 'highpass';
+  hpf.frequency.setValueAtTime(kind === 'hat' ? 6500 : kind === 'snare' ? 1200 : 80, t0);
+
+  const lpf = audioCtx.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.setValueAtTime(kind === 'hat' ? 12000 : kind === 'snare' ? 9000 : 2200, t0);
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+  src.connect(hpf).connect(lpf).connect(g);
+  connectToMusic(g);
+  src.start(t0);
+  src.stop(t0 + dur);
+}
+
+function playMusicKick({ t = null, gain = 0.06 } = {}) {
+  if (!audioCtx) return;
+  const t0 = t ?? audioCtx.currentTime;
+  const dur = 0.12;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(140, t0);
+  o.frequency.exponentialRampToValueAtTime(48, t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g);
+  connectToMusic(g);
+  o.start(t0);
+  o.stop(t0 + dur + 0.02);
+}
+
+function startChiptune() {
+  if (!audioCtx) return;
+  initAudioGraph();
+  if (musicState) return;
+
+  const bpm = 146;
+  const stepDur = 60 / bpm / 4; // 16th notes
+
+  // Two-bar loop (32 steps). 0 = rest.
+  // Key: A minor-ish arcade loop.
+  const lead = [
+    81, 0, 81, 0, 79, 0, 76, 0,
+    74, 0, 76, 0, 79, 0, 81, 0,
+    83, 0, 83, 0, 81, 0, 79, 0,
+    76, 0, 79, 0, 81, 0, 74, 0,
+  ];
+
+  const bass = [
+    45, 0, 45, 0, 45, 0, 45, 0,
+    43, 0, 43, 0, 43, 0, 43, 0,
+    41, 0, 41, 0, 41, 0, 41, 0,
+    43, 0, 43, 0, 43, 0, 43, 0,
+  ];
+
+  // Drums
+  const hat = new Array(32).fill(1);
+  const snare = hat.map((_, i) => (i % 8 === 4 ? 1 : 0));
+  const kick = hat.map((_, i) => (i % 8 === 0 ? 1 : i % 16 === 10 ? 1 : 0));
+
+  const t0 = audioCtx.currentTime + 0.05;
+  musicGain.gain.cancelScheduledValues(t0);
+  musicGain.gain.setValueAtTime(musicGain.gain.value, t0);
+  musicGain.gain.linearRampToValueAtTime(musicGain.gain.value, t0 + 0.15);
+
+  let step = 0;
+  let nextT = t0;
+  const lookahead = 0.10;
+
+  const timer = window.setInterval(() => {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    while (nextT < now + lookahead) {
+      const i = step % 32;
+      const l = lead[i];
+      const b = bass[i];
+
+      if (kick[i]) playMusicKick({ t: nextT, gain: 0.060 });
+      if (snare[i]) playMusicDrum({ kind: 'snare', t: nextT, gain: 0.040 });
+      if (hat[i]) playMusicDrum({ kind: 'hat', t: nextT, gain: 0.018 });
+
+      if (b) playMusicTone({ type: 'triangle', midi: b, t: nextT, dur: stepDur * 0.95, gain: 0.035, pan: -0.10 });
+      if (l) playMusicTone({ type: 'square', midi: l, t: nextT, dur: stepDur * 0.85, gain: 0.030, pan: 0.10 });
+
+      step++;
+      nextT += stepDur;
+    }
+  }, 50);
+
+  musicState = { timer };
+}
+
+function stopChiptune() {
+  if (!audioCtx) return;
+  if (!musicState) return;
+  const t0 = audioCtx.currentTime;
+  try {
+    musicGain.gain.cancelScheduledValues(t0);
+    musicGain.gain.setValueAtTime(musicGain.gain.value, t0);
+    musicGain.gain.linearRampToValueAtTime(0.0, t0 + 0.18);
+  } catch {
+    // ignore
+  }
+  window.clearInterval(musicState.timer);
+  musicState = null;
+}
+
+function playNoise({ dur = 0.08, gain = 0.06, hp = 180, lp = 12000, q = 0.6, pan = 0.0 } = {}) {
   if (!audioCtx) return;
   const t0 = audioCtx.currentTime;
   const bufferSize = Math.floor(audioCtx.sampleRate * dur);
   const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
   const data = buffer.getChannelData(0);
-  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+  for (let i = 0; i < bufferSize; i++) {
+    const env = 1 - i / bufferSize;
+    data[i] = (Math.random() * 2 - 1) * env;
+  }
 
   const src = audioCtx.createBufferSource();
   src.buffer = buffer;
 
+  const hpf = audioCtx.createBiquadFilter();
+  hpf.type = 'highpass';
+  hpf.frequency.setValueAtTime(hp, t0);
+
+  const lpf = audioCtx.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.setValueAtTime(lp, t0);
+  lpf.Q.setValueAtTime(q, t0);
+
   const g = audioCtx.createGain();
-  g.gain.setValueAtTime(gain, t0);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.005);
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
-  const hp = audioCtx.createBiquadFilter();
-  hp.type = 'highpass';
-  hp.frequency.setValueAtTime(180, t0);
+  const p = audioCtx.createStereoPanner();
+  p.pan.setValueAtTime(clamp(pan, -1, 1), t0);
 
-  src.connect(hp).connect(g).connect(audioCtx.destination);
+  src.connect(hpf).connect(lpf).connect(g).connect(p);
+  connectToSfx(p);
   src.start(t0);
   src.stop(t0 + dur);
+}
+
+function playTone({ type = 'sine', freq = 440, dur = 0.08, gain = 0.05, detune = 0, pan = 0.0, endFreq = null } = {}) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  const p = audioCtx.createStereoPanner();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (endFreq != null) o.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), t0 + dur);
+  o.detune.setValueAtTime(detune, t0);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(gain, t0 + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  p.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+  o.connect(g).connect(p);
+  connectToSfx(p);
+  o.start(t0);
+  o.stop(t0 + dur + 0.02);
+}
+
+function sfxWeaponSwitch(kind) {
+  // Short and snappy; slightly different timbre per weapon.
+  if (kind === 'rocket') {
+    playTone({ type: 'triangle', freq: 220, endFreq: 280, dur: 0.06, gain: 0.045 });
+    playNoise({ dur: 0.04, gain: 0.020, hp: 600, lp: 7000 });
+  } else if (kind === 'laser') {
+    playTone({ type: 'sine', freq: 720, endFreq: 980, dur: 0.05, gain: 0.040 });
+  } else {
+    playTone({ type: 'triangle', freq: 420, endFreq: 520, dur: 0.05, gain: 0.040 });
+  }
+}
+
+function sfxCannon() {
+  // Tight thump + click.
+  playTone({ type: 'square', freq: 140, endFreq: 90, dur: 0.08, gain: 0.060 });
+  playNoise({ dur: 0.045, gain: 0.030, hp: 700, lp: 6000 });
+}
+
+function sfxLaser() {
+  // Zap: fast pitch sweep + airy hiss.
+  playTone({ type: 'sawtooth', freq: 1200, endFreq: 420, dur: 0.045, gain: 0.040 });
+  playNoise({ dur: 0.05, gain: 0.020, hp: 1500, lp: 12000 });
+}
+
+function sfxRocketLaunch() {
+  // Whoosh + low ignition bump.
+  playTone({ type: 'sine', freq: 90, endFreq: 55, dur: 0.12, gain: 0.050 });
+  playNoise({ dur: 0.16, gain: 0.040, hp: 180, lp: 4500 });
+}
+
+function sfxExplosion(size01 = 1.0) {
+  // Layered blast: sub thump + noisy crack.
+  const s = clamp(size01, 0.2, 1.4);
+  playTone({ type: 'sine', freq: 85, endFreq: 38, dur: 0.22, gain: 0.090 * s });
+  playTone({ type: 'triangle', freq: 180, endFreq: 70, dur: 0.18, gain: 0.050 * s, detune: (Math.random() * 30 - 15) });
+  playNoise({ dur: 0.22, gain: 0.080 * s, hp: 120, lp: 7000, q: 0.7 });
+  // Extra bite
+  playNoise({ dur: 0.10, gain: 0.040 * s, hp: 1400, lp: 12000 });
+}
+
+function sfxEnemyShot() {
+  playTone({ type: 'square', freq: 360, endFreq: 260, dur: 0.06, gain: 0.030 });
+  playNoise({ dur: 0.045, gain: 0.018, hp: 900, lp: 8500 });
+}
+
+function sfxPlayerHit() {
+  playTone({ type: 'sawtooth', freq: 160, endFreq: 80, dur: 0.12, gain: 0.060 });
+  playNoise({ dur: 0.12, gain: 0.050, hp: 220, lp: 6000 });
+}
+
+function sfxReset() {
+  playTone({ type: 'triangle', freq: 320, endFreq: 480, dur: 0.07, gain: 0.040 });
+}
+
+function startEngineHum() {
+  if (!audioCtx) return;
+  initAudioGraph();
+  stopEngineHum();
+
+  const t0 = audioCtx.currentTime;
+
+  const base = audioCtx.createOscillator();
+  base.type = 'sawtooth';
+  base.frequency.setValueAtTime(55, t0);
+
+  const sub = audioCtx.createOscillator();
+  sub.type = 'sine';
+  sub.frequency.setValueAtTime(28, t0);
+
+  const lpf = audioCtx.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.setValueAtTime(240, t0);
+  lpf.Q.setValueAtTime(0.7, t0);
+
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.12);
+
+  base.connect(lpf);
+  sub.connect(lpf);
+  lpf.connect(g);
+
+  // a bit of air from filtered noise
+  const noise = (() => {
+    const dur = 0.6;
+    const bufferSize = Math.floor(audioCtx.sampleRate * dur);
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+    return src;
+  })();
+
+  const noiseHp = audioCtx.createBiquadFilter();
+  noiseHp.type = 'highpass';
+  noiseHp.frequency.setValueAtTime(600, t0);
+  const noiseLp = audioCtx.createBiquadFilter();
+  noiseLp.type = 'lowpass';
+  noiseLp.frequency.setValueAtTime(2600, t0);
+  const noiseG = audioCtx.createGain();
+  noiseG.gain.setValueAtTime(0.03, t0);
+
+  noise.connect(noiseHp).connect(noiseLp).connect(noiseG).connect(g);
+
+  g.connect(engineGain);
+  engineGain.gain.setValueAtTime(0.0, t0);
+  engineGain.gain.linearRampToValueAtTime(0.38, t0 + 0.18);
+
+  base.start(t0);
+  sub.start(t0);
+  noise.start(t0);
+
+  engineState = { base, sub, noise, lpf, g, noiseLp, noiseG };
+}
+
+function stopEngineHum() {
+  if (!audioCtx) return;
+  if (!engineState) return;
+  const t0 = audioCtx.currentTime;
+  try {
+    engineGain.gain.cancelScheduledValues(t0);
+    engineGain.gain.setValueAtTime(engineGain.gain.value, t0);
+    engineGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.14);
+  } catch {
+    // ignore
+  }
+  const stopAt = t0 + 0.16;
+  try { engineState.base.stop(stopAt); } catch {}
+  try { engineState.sub.stop(stopAt); } catch {}
+  try { engineState.noise.stop(stopAt); } catch {}
+  engineState = null;
+}
+
+function setEngineIntensity(intensity01) {
+  if (!audioCtx || !engineState) return;
+  const t0 = audioCtx.currentTime;
+  const x = clamp(intensity01, 0, 1);
+  // Brighten filter and raise pitch with speed.
+  engineState.base.frequency.setTargetAtTime(55 + x * 110, t0, 0.03);
+  engineState.sub.frequency.setTargetAtTime(28 + x * 26, t0, 0.03);
+  engineState.lpf.frequency.setTargetAtTime(240 + x * 1200, t0, 0.04);
+  engineState.noiseLp.frequency.setTargetAtTime(2600 + x * 3800, t0, 0.05);
+  engineState.noiseG.gain.setTargetAtTime(0.02 + x * 0.06, t0, 0.05);
+}
+
+// Backwards-compatible wrappers (kept so existing calls still work)
+function beep({ type = 'sine', freq = 440, dur = 0.08, gain = 0.05, detune = 0 } = {}) {
+  playTone({ type, freq, dur, gain, detune });
+}
+
+function noiseBurst({ dur = 0.08, gain = 0.06 } = {}) {
+  playNoise({ dur, gain });
 }
 
 // -----------------
@@ -105,6 +516,7 @@ const crtPass = new ShaderPass({
     uCurvature: { value: 0.22 },
     uNoise: { value: 0.22 },
     uFlash: { value: 0.0 },
+    uDamage: { value: 0.0 },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -123,6 +535,7 @@ const crtPass = new ShaderPass({
     uniform float uCurvature;
     uniform float uNoise;
     uniform float uFlash;
+    uniform float uDamage;
     varying vec2 vUv;
 
     float hash(vec2 p) {
@@ -172,6 +585,9 @@ const crtPass = new ShaderPass({
 
       // flash on big impacts
       col += vec3(0.35, 0.45, 0.65) * uFlash;
+
+      // damage tint
+      col = mix(col, col + vec3(0.85, 0.15, 0.10), clamp(uDamage, 0.0, 1.0));
 
       gl_FragColor = vec4(col, 1.0);
     }
@@ -934,10 +1350,16 @@ document.addEventListener('click', () => {
 
 controls.addEventListener('lock', () => {
   overlay.classList.add('hidden');
+  // Start continuous engine hum once gameplay begins.
+  ensureAudio();
+  startEngineHum();
+  startChiptune();
 });
 
 controls.addEventListener('unlock', () => {
   overlay.classList.remove('hidden');
+  stopEngineHum();
+  stopChiptune();
 });
 
 const velocity = new THREE.Vector3();
@@ -956,6 +1378,12 @@ function getMoveInput() {
 let score = 0;
 let highScore = Number(localStorage.getItem('3blast_highScore') || 0);
 
+let hp = 100;
+const maxHp = 100;
+let invulnT = 0;
+
+hpEl.textContent = String(hp);
+
 highScoreEl.textContent = String(highScore);
 scoreEl.textContent = String(score);
 
@@ -963,6 +1391,256 @@ const raycaster = new THREE.Raycaster();
 const tmpV = new THREE.Vector3();
 
 const projectiles = [];
+
+// -----------------
+// Enemies (arcade ships)
+// -----------------
+const enemyGroup = new THREE.Group();
+scene.add(enemyGroup);
+
+const enemies = [];
+const enemyShots = [];
+
+function createEnemyMesh() {
+  const bodyGeo = new THREE.OctahedronGeometry(3.2, 0);
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0xff5ee6,
+    roughness: 0.35,
+    metalness: 0.25,
+    emissive: new THREE.Color(0x4b0d45),
+    emissiveIntensity: 1.45,
+  });
+
+  const mesh = new THREE.Mesh(bodyGeo, bodyMat);
+
+  // neon ring
+  const ring = new THREE.TorusGeometry(3.35, 0.28, 10, 28);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0x7aa9ff,
+    transparent: true,
+    opacity: 0.85,
+  });
+  const ringMesh = new THREE.Mesh(ring, ringMat);
+  ringMesh.rotation.x = Math.PI / 2;
+  mesh.add(ringMesh);
+
+  return mesh;
+}
+
+function spawnEnemies(count = 8) {
+  // clear
+  while (enemyGroup.children.length) enemyGroup.remove(enemyGroup.children[0]);
+  enemies.length = 0;
+  for (const s of enemyShots) {
+    scene.remove(s.mesh);
+    if (s.tracer) scene.remove(s.tracer);
+  }
+  enemyShots.length = 0;
+
+  const { halfW, halfD, spacing } = cityState;
+
+  for (let i = 0; i < count; i++) {
+    const mesh = createEnemyMesh();
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 120 + Math.random() * 220;
+    const height = 40 + Math.random() * 90;
+    const angVel = (Math.random() * 0.25 + 0.14) * (Math.random() > 0.5 ? 1 : -1);
+    const drift = new THREE.Vector3((Math.random() * 2 - 1) * halfW * 0.15, 0, (Math.random() * 2 - 1) * halfD * 0.15);
+
+    // Each enemy has its own patrol center (not tied to the player).
+    const center = new THREE.Vector3(drift.x, height, drift.z);
+
+    mesh.position.set(center.x + Math.cos(angle) * radius, height, center.z + Math.sin(angle) * radius);
+    // tag for raycast/lookup
+    mesh.userData.enemyIndex = enemies.length;
+    mesh.children.forEach((ch) => (ch.userData.enemyIndex = mesh.userData.enemyIndex));
+    enemyGroup.add(mesh);
+
+    enemies.push({
+      mesh,
+      angle,
+      radius,
+      height,
+      angVel,
+      drift,
+      center,
+      health: 70,
+      maxHealth: 70,
+      nextShotAt: 0,
+      shotCooldown: 0.65 + Math.random() * 0.6,
+    });
+  }
+}
+
+// Spawn initial wave after city has been generated.
+spawnEnemies();
+
+function updateEnemies(nowSec, dt) {
+  const playerPos = player.position;
+  const aimPos = new THREE.Vector3(playerPos.x, playerPos.y + 1.6, playerPos.z);
+
+  for (const e of enemies) {
+    if (e.dead) continue;
+
+    e.angle += e.angVel * dt * 0.45;
+
+    // Gentle engagement drift (so enemies feel aware, but your input doesn't directly "move" them).
+    // We drift the patrol center slightly toward the player's XZ when close.
+    const pos = e.mesh.position;
+    const dist = pos.distanceTo(playerPos);
+    if (dist < 420) {
+      const t = 1 - Math.pow(0.995, dt); // very slow
+      e.center.x = lerp(e.center.x, playerPos.x, t);
+      e.center.z = lerp(e.center.z, playerPos.z, t);
+    }
+
+    // orbit around player with a little drift
+    const targetX = e.center.x + Math.cos(e.angle) * e.radius;
+    const targetZ = e.center.z + Math.sin(e.angle) * e.radius;
+    const targetY = e.height + Math.sin((nowSec + e.angle) * 0.7) * 8;
+
+    pos.x = lerp(pos.x, targetX, 1 - Math.pow(0.35, dt));
+    pos.z = lerp(pos.z, targetZ, 1 - Math.pow(0.35, dt));
+    pos.y = lerp(pos.y, targetY, 1 - Math.pow(0.40, dt));
+
+    // face the player
+    e.mesh.lookAt(aimPos);
+    e.mesh.rotateY(Math.PI);
+
+    // shoot if close enough
+    if (dist < 520 && nowSec >= e.nextShotAt && controls.isLocked) {
+      e.nextShotAt = nowSec + e.shotCooldown;
+
+      const origin = pos.clone();
+      const dir = aimPos.clone().sub(origin).normalize();
+      const speed = 120;
+
+      const geo = new THREE.SphereGeometry(0.28, 10, 10);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xff4aa8,
+        emissive: new THREE.Color(0xff4aa8),
+        emissiveIntensity: 1.2,
+        roughness: 0.2,
+        metalness: 0.0,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(origin).add(dir.clone().multiplyScalar(3));
+      scene.add(mesh);
+
+      // tracer
+      const tracerGeo = new THREE.BufferGeometry();
+      const tracerArr = new Float32Array(6);
+      tracerGeo.setAttribute('position', new THREE.BufferAttribute(tracerArr, 3));
+      const tracerMat = new THREE.LineBasicMaterial({
+        color: 0xff4aa8,
+        transparent: true,
+        opacity: 0.55,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const tracer = new THREE.Line(tracerGeo, tracerMat);
+      tracer.renderOrder = 4;
+      scene.add(tracer);
+
+      enemyShots.push({ mesh, vel: dir.multiplyScalar(speed), life: 2.8, tracer, prevPos: mesh.position.clone(), damage: 10 });
+      sfxEnemyShot();
+    }
+  }
+}
+
+function updateEnemyShots(dt) {
+  // Player hit sphere roughly around camera
+  const playerHitPos = new THREE.Vector3(player.position.x, player.position.y + 1.6, player.position.z);
+
+  for (let i = enemyShots.length - 1; i >= 0; i--) {
+    const s = enemyShots[i];
+    s.life -= dt;
+    s.mesh.position.addScaledVector(s.vel, dt);
+
+    // tracer update
+    if (s.tracer) {
+      const arr = s.tracer.geometry.attributes.position.array;
+      const tail = s.prevPos;
+      const head = s.mesh.position;
+      arr[0] = tail.x;
+      arr[1] = tail.y;
+      arr[2] = tail.z;
+      arr[3] = head.x;
+      arr[4] = head.y;
+      arr[5] = head.z;
+      s.tracer.geometry.attributes.position.needsUpdate = true;
+      s.tracer.material.opacity = 0.55 * clamp(s.life / 2.8, 0, 1);
+      s.prevPos.copy(head);
+    }
+
+    // collide with ground
+    if (s.mesh.position.y <= 0.6) {
+      spawnExplosionParticles(s.mesh.position.clone(), 0xff4aa8, 42);
+      spawnShockwave(s.mesh.position.clone().add(new THREE.Vector3(0, 0.2, 0)), 0xff4aa8);
+      scene.remove(s.mesh);
+      if (s.tracer) scene.remove(s.tracer);
+      enemyShots.splice(i, 1);
+      continue;
+    }
+
+    // collide with player
+    if (s.mesh.position.distanceTo(playerHitPos) < 2.1) {
+      spawnExplosionParticles(s.mesh.position.clone(), 0xff4aa8, 62);
+      scene.remove(s.mesh);
+      if (s.tracer) scene.remove(s.tracer);
+      enemyShots.splice(i, 1);
+      playerHit(s.damage);
+      continue;
+    }
+
+    if (s.life <= 0) {
+      scene.remove(s.mesh);
+      if (s.tracer) scene.remove(s.tracer);
+      enemyShots.splice(i, 1);
+    }
+  }
+}
+
+function addHp(delta) {
+  hp = clamp(hp + delta, 0, maxHp);
+  hpEl.textContent = String(Math.round(hp));
+}
+
+function playerHit(dmg) {
+  if (invulnT > 0) return;
+  invulnT = 0.35;
+  addHp(-dmg);
+  cameraShake(0.55, 0.22);
+  crtPass.uniforms.uDamage.value = Math.min(1.0, crtPass.uniforms.uDamage.value + 0.85);
+  sfxPlayerHit();
+
+  if (hp <= 0) {
+    // quick arcade-style respawn (no new UI screens)
+    sfxExplosion(0.9);
+    resetGame();
+  }
+}
+
+function damageEnemy(enemy, amount, hitPoint) {
+  if (!enemy) return;
+  enemy.health -= amount;
+  enemy.mesh.material.emissiveIntensity = 1.45 + (1 - clamp(enemy.health / enemy.maxHealth, 0, 1)) * 1.25;
+  if (hitPoint) spawnExplosionParticles(hitPoint, 0xff5ee6, 22);
+
+  if (enemy.health <= 0) {
+    const pos = enemy.mesh.position.clone();
+    spawnShockwave(pos.clone().add(new THREE.Vector3(0, 0.25, 0)), 0xff5ee6);
+    spawnExplosionParticles(pos, 0xff5ee6, 120);
+    spawnDebris(pos, 12);
+    enemyGroup.remove(enemy.mesh);
+    enemy.mesh.visible = false;
+    enemy.dead = true;
+    addScore(250);
+    sfxExplosion(0.75);
+  } else {
+    addScore(5);
+  }
+}
 
 const weaponDefs = {
   cannon: { name: 'Cannon', cooldown: 0.12, speed: 240, damage: 26, radius: 0, color: 0x9db7ff },
@@ -977,7 +1655,7 @@ function setWeapon(key) {
   if (!weaponDefs[key]) return;
   weaponKey = key;
   weaponEl.textContent = weaponDefs[key].name;
-  beep({ type: 'triangle', freq: key === 'rocket' ? 220 : key === 'laser' ? 680 : 440, dur: 0.06, gain: 0.04 });
+  sfxWeaponSwitch(key);
 }
 
 setWeapon('cannon');
@@ -991,9 +1669,19 @@ function fire(now) {
     // hitscan
     raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
     const hits = raycaster.intersectObjects(cityGroup.children, false);
+    const enemyHits = raycaster.intersectObjects(enemyGroup.children, false);
     const from = camera.getWorldPosition(new THREE.Vector3());
     const dir = camera.getWorldDirection(new THREE.Vector3()).normalize();
-    const to = hits.length ? hits[0].point.clone() : from.clone().add(dir.multiplyScalar(520));
+    const nearest = (() => {
+      const a = hits.length ? hits[0] : null;
+      const b = enemyHits.length ? enemyHits[0] : null;
+      if (!a && !b) return null;
+      if (a && !b) return a;
+      if (!a && b) return b;
+      return a.distance < b.distance ? a : b;
+    })();
+
+    const to = nearest ? nearest.point.clone() : from.clone().add(dir.multiplyScalar(520));
 
     // Beam visual
     {
@@ -1013,16 +1701,23 @@ function fire(now) {
       scene.add(line);
     }
 
-    if (hits.length) {
-      const hit = hits[0];
-      const b = buildings[hit.object.userData.buildingIndex];
-      if (b?.alive) {
-        damageBuilding(b, w.damage, hit.point, w.color);
-        spawnExplosionParticles(hit.point, w.color, 28);
-        beep({ type: 'sine', freq: 920, dur: 0.03, gain: 0.035 });
+    if (nearest) {
+      if (nearest.object.parent === enemyGroup || nearest.object === enemyGroup) {
+        const idx = nearest.object.userData.enemyIndex;
+        const e = enemies[idx];
+        if (e && !e.dead) damageEnemy(e, 18, nearest.point);
+      } else {
+        const hit = nearest;
+        const b = buildings[hit.object.userData.buildingIndex];
+        if (b?.alive) {
+          damageBuilding(b, w.damage, hit.point, w.color);
+          spawnExplosionParticles(hit.point, w.color, 28);
+        }
       }
+      sfxLaser();
     } else {
-      beep({ type: 'sine', freq: 720, dur: 0.02, gain: 0.02 });
+      // Missed laser still makes a lighter zap.
+      playTone({ type: 'sine', freq: 650, endFreq: 520, dur: 0.03, gain: 0.020 });
     }
     return;
   }
@@ -1068,10 +1763,9 @@ function fire(now) {
   projectiles.push({ mesh, vel, life: weaponKey === 'rocket' ? 2.8 : 2.0, weapon: weaponKey, tracer, prevPos: mesh.position.clone() });
 
   if (weaponKey === 'rocket') {
-    noiseBurst({ dur: 0.07, gain: 0.05 });
-    beep({ type: 'sawtooth', freq: 140, dur: 0.07, gain: 0.03 });
+    sfxRocketLaunch();
   } else {
-    beep({ type: 'square', freq: 520, dur: 0.04, gain: 0.03 });
+    sfxCannon();
   }
 }
 
@@ -1117,8 +1811,7 @@ function damageBuilding(b, amount, hitPoint, fxColor) {
     spawnExplosionParticles(pos.clone().add(new THREE.Vector3(0, h * 0.25, 0)), fxColor, 110);
     spawnShockwave(pos.clone().add(new THREE.Vector3(0, 0.25, 0)), fxColor);
 
-    noiseBurst({ dur: 0.10, gain: 0.07 });
-    beep({ type: 'sawtooth', freq: 90, dur: 0.12, gain: 0.03 });
+    sfxExplosion(1.05);
 
     cameraShake(0.55, 0.22);
     crtPass.uniforms.uFlash.value = Math.min(1.0, crtPass.uniforms.uFlash.value + 0.45);
@@ -1136,22 +1829,29 @@ function explodeAt(point, radius, damage, color) {
   cameraShake(0.85, 0.28);
   crtPass.uniforms.uFlash.value = Math.min(1.0, crtPass.uniforms.uFlash.value + 0.65);
 
+  // Scale sound by blast size.
+  sfxExplosion(clamp((radius / 18) * 0.95, 0.5, 1.25));
+
   for (const b of buildings) {
     if (!b.alive) continue;
-    const p = b.mesh.position;
-    const dist = p.distanceTo(point);
+    // Use distance to the building's bounds (not its center), otherwise tall
+    // buildings can take little/no damage when the explosion is near the base.
+    const dist = b.box.distanceToPoint(point);
     if (dist > radius) continue;
     const falloff = 1 - dist / radius;
     damageBuilding(b, damage * falloff, point, color);
   }
 
-  noiseBurst({ dur: 0.12, gain: 0.08 });
-  beep({ type: 'sawtooth', freq: 75, dur: 0.16, gain: 0.03 });
+  // (Sound handled above.)
 }
 
 function resetGame() {
   score = 0;
   scoreEl.textContent = String(score);
+
+  hp = maxHp;
+  invulnT = 0;
+  hpEl.textContent = String(hp);
 
   // clear fx
   for (const d of debris) scene.remove(d.mesh);
@@ -1172,7 +1872,8 @@ function resetGame() {
 
   spawnCity();
   spawnCityDressing();
-  beep({ type: 'triangle', freq: 320, dur: 0.06, gain: 0.04 });
+  spawnEnemies();
+  sfxReset();
 }
 
 // -----------------
@@ -1188,6 +1889,8 @@ function tick(now) {
 
   crtPass.uniforms.uTime.value = now / 1000;
   crtPass.uniforms.uFlash.value = Math.max(0, crtPass.uniforms.uFlash.value - dt * 1.8);
+  crtPass.uniforms.uDamage.value = Math.max(0, crtPass.uniforms.uDamage.value - dt * 2.6);
+  invulnT = Math.max(0, invulnT - dt);
 
   // slow star drift
   starGroup.position.copy(player.position);
@@ -1207,7 +1910,9 @@ function tick(now) {
   if (controls.isLocked) {
     const { forward, strafe, up } = getMoveInput();
 
-    const speed = keys.get('ControlLeft') || keys.get('ControlRight') ? 55 : 78;
+    // Flight tuning: keep player ~2x faster than enemies.
+    // Ctrl acts as a boost.
+    const speed = keys.get('ControlLeft') || keys.get('ControlRight') ? 330 : 240;
 
     // Convert input to world-space, based on the camera's facing.
     const fwd = tmpV.set(0, 0, 0);
@@ -1225,12 +1930,20 @@ function tick(now) {
 
     velocity.addScaledVector(accel, dt);
 
-    // damping
-    const damp = Math.pow(0.06, dt);
+    // damping (lower drag than before)
+    const damp = Math.pow(0.14, dt);
     velocity.multiplyScalar(damp);
 
     // apply
     player.position.addScaledVector(velocity, dt);
+
+    // Engine audio reacts to actual velocity (not just input).
+    // Map speed to 0..1 with a soft knee.
+    if (audioCtx && engineState) {
+      const v = velocity.length();
+      const x = clamp((v - 5) / 260, 0, 1);
+      setEngineIntensity(x * x);
+    }
 
     // stay above ground
     player.position.y = Math.max(4.0, player.position.y);
@@ -1238,6 +1951,10 @@ function tick(now) {
     // firing
     if (isFiring) fire(now / 1000);
   }
+
+  // enemies + shots
+  updateEnemies(now / 1000, dt);
+  updateEnemyShots(dt);
 
   // camera shake (applied as small local offset)
   camera.position.copy(baseCamLocalPos);
@@ -1293,6 +2010,37 @@ function tick(now) {
     if (pr.mesh.position.y <= 0.6) {
       const w = weaponDefs[pr.weapon];
       if (pr.weapon === 'rocket') explodeAt(pr.mesh.position.clone(), w.radius, w.damage, w.color);
+      scene.remove(pr.mesh);
+      if (pr.tracer) scene.remove(pr.tracer);
+      projectiles.splice(i, 1);
+      continue;
+    }
+
+    // collide with enemies
+    let hitEnemy = null;
+    for (const e of enemies) {
+      if (e.dead) continue;
+      if (e.mesh.position.distanceTo(pr.mesh.position) < 2.4) {
+        hitEnemy = e;
+        break;
+      }
+    }
+
+    if (hitEnemy) {
+      const w = weaponDefs[pr.weapon];
+      if (pr.weapon === 'rocket') {
+        // splash damage: explode and also hurt nearby enemies
+        explodeAt(pr.mesh.position.clone(), w.radius, w.damage, w.color);
+        for (const e of enemies) {
+          if (e.dead) continue;
+          const dist = e.mesh.position.distanceTo(pr.mesh.position);
+          if (dist <= w.radius) damageEnemy(e, w.damage * (1 - dist / w.radius), pr.mesh.position);
+        }
+      } else {
+        damageEnemy(hitEnemy, w.damage, pr.mesh.position.clone());
+        cameraShake(0.18, 0.12);
+      }
+
       scene.remove(pr.mesh);
       if (pr.tracer) scene.remove(pr.tracer);
       projectiles.splice(i, 1);
