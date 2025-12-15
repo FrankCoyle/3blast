@@ -312,7 +312,333 @@ spawnStarfield();
 const cityGroup = new THREE.Group();
 scene.add(cityGroup);
 
+// Extra city dressing (roads/trees/cars)
+const roadsGroup = new THREE.Group();
+roadsGroup.renderOrder = 1;
+scene.add(roadsGroup);
+
+const propsGroup = new THREE.Group();
+scene.add(propsGroup);
+
+const trafficGroup = new THREE.Group();
+scene.add(trafficGroup);
+
 const buildings = [];
+
+let cityState = {
+  rows: 18,
+  cols: 18,
+  spacing: 18,
+  halfW: (18 - 1) * 18 * 0.5,
+  halfD: (18 - 1) * 18 * 0.5,
+};
+
+function createRoadTexture() {
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 512;
+  const ctx = c.getContext('2d');
+
+  // asphalt base
+  ctx.fillStyle = '#0b0f18';
+  ctx.fillRect(0, 0, c.width, c.height);
+
+  // subtle noise
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() * 18) | 0;
+    img.data[i + 0] = Math.min(255, img.data[i + 0] + n);
+    img.data[i + 1] = Math.min(255, img.data[i + 1] + n);
+    img.data[i + 2] = Math.min(255, img.data[i + 2] + n);
+    img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // lane markings (center dashed + faint edges)
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 6;
+  ctx.setLineDash([28, 22]);
+  ctx.beginPath();
+  ctx.moveTo(c.width * 0.5, 0);
+  ctx.lineTo(c.width * 0.5, c.height);
+  ctx.stroke();
+
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(255, 214, 120, 0.30)';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(c.width * 0.18, 0);
+  ctx.lineTo(c.width * 0.18, c.height);
+  ctx.moveTo(c.width * 0.82, 0);
+  ctx.lineTo(c.width * 0.82, c.height);
+  ctx.stroke();
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = 16;
+  return tex;
+}
+
+const roadTexture = createRoadTexture();
+const roadMaterial = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  map: roadTexture,
+  roughness: 0.95,
+  metalness: 0.0,
+  emissive: new THREE.Color(0x0b1225),
+  emissiveIntensity: 0.35,
+});
+
+function clearGroup(g) {
+  while (g.children.length) {
+    const child = g.children[g.children.length - 1];
+    g.remove(child);
+    child.geometry?.dispose?.();
+    if (Array.isArray(child.material)) child.material.forEach((m) => m?.dispose?.());
+    else child.material?.dispose?.();
+  }
+}
+
+function spawnRoads() {
+  clearGroup(roadsGroup);
+  const { rows, cols, spacing, halfW, halfD } = cityState;
+
+  const roadW = 8.5;
+  const y = 0.02;
+
+  const lenZ = (rows - 1) * spacing + spacing;
+  const lenX = (cols - 1) * spacing + spacing;
+
+  // Vertical roads (along Z), between columns
+  for (let c = 0; c < cols - 1; c++) {
+    const x = (c * spacing - halfW) + spacing * 0.5;
+    const geo = new THREE.PlaneGeometry(roadW, lenZ);
+    const mesh = new THREE.Mesh(geo, roadMaterial);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(x, y, 0);
+    mesh.material.map.repeat.set(1, lenZ / 28);
+    mesh.material.map.rotation = 0;
+    roadsGroup.add(mesh);
+  }
+
+  // Horizontal roads (along X), between rows
+  for (let r = 0; r < rows - 1; r++) {
+    const z = (r * spacing - halfD) + spacing * 0.5;
+    const geo = new THREE.PlaneGeometry(lenX, roadW);
+    const mesh = new THREE.Mesh(geo, roadMaterial);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(0, y, z);
+    mesh.material.map.repeat.set(1, lenX / 28);
+    mesh.material.map.rotation = Math.PI / 2;
+    roadsGroup.add(mesh);
+  }
+
+  // Main boulevard (wider, centered)
+  {
+    const boulevardW = spacing * 1.35;
+    const geo = new THREE.PlaneGeometry(boulevardW, lenZ);
+    const m = roadMaterial.clone();
+    m.emissiveIntensity = 0.45;
+    const mesh = new THREE.Mesh(geo, m);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(0, y + 0.002, 0);
+    mesh.material.map.repeat.set(1, lenZ / 18);
+    mesh.material.map.rotation = 0;
+    roadsGroup.add(mesh);
+  }
+}
+
+let treeTrunks = null;
+let treeCanopies = null;
+
+function spawnTrees() {
+  // Keep trees simple + fast via instancing.
+  if (treeTrunks) propsGroup.remove(treeTrunks);
+  if (treeCanopies) propsGroup.remove(treeCanopies);
+
+  const trunkGeo = new THREE.CylinderGeometry(0.22, 0.28, 2.0, 8);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x3a2c1d, roughness: 1.0, metalness: 0.0 });
+  const canopyGeo = new THREE.IcosahedronGeometry(1.35, 0);
+  const canopyMat = new THREE.MeshStandardMaterial({
+    color: 0x1e6b3e,
+    roughness: 1.0,
+    metalness: 0.0,
+    emissive: new THREE.Color(0x0f2a18),
+    emissiveIntensity: 0.25,
+  });
+
+  const count = 260;
+  treeTrunks = new THREE.InstancedMesh(trunkGeo, trunkMat, count);
+  treeCanopies = new THREE.InstancedMesh(canopyGeo, canopyMat, count);
+  treeTrunks.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  treeCanopies.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+  const dummy = new THREE.Object3D();
+  const { spacing, halfW, halfD } = cityState;
+
+  let placed = 0;
+  let tries = 0;
+  while (placed < count && tries < count * 20) {
+    tries++;
+    const x = (Math.random() * 2 - 1) * (halfW + spacing * 0.25);
+    const z = (Math.random() * 2 - 1) * (halfD + spacing * 0.25);
+
+    // Prefer parks and boulevard edges
+    const inPark = Math.abs(z) < spacing * 0.55 && Math.abs(x) > spacing * 3;
+    const nearBoulevard = Math.abs(x) < spacing * 1.2 && Math.abs(z) > spacing * 1.2;
+    if (!inPark && !nearBoulevard && Math.random() < 0.70) continue;
+
+    // Avoid the center of roads a bit
+    const roadBand = Math.abs((Math.abs(x) % spacing) - spacing * 0.5) < 4.5 || Math.abs((Math.abs(z) % spacing) - spacing * 0.5) < 4.5;
+    if (roadBand && !inPark && Math.random() < 0.85) continue;
+
+    const s = 0.85 + Math.random() * 0.7;
+    dummy.position.set(x, 0.0, z);
+    dummy.rotation.y = Math.random() * Math.PI * 2;
+    dummy.scale.set(s, 1.0 + Math.random() * 0.6, s);
+    dummy.updateMatrix();
+    treeTrunks.setMatrixAt(placed, dummy.matrix);
+
+    dummy.position.set(x, 2.0 + Math.random() * 0.8, z);
+    dummy.rotation.y = Math.random() * Math.PI * 2;
+    dummy.scale.set(1.05 + Math.random() * 0.6, 1.05 + Math.random() * 0.6, 1.05 + Math.random() * 0.6);
+    dummy.updateMatrix();
+    treeCanopies.setMatrixAt(placed, dummy.matrix);
+
+    placed++;
+  }
+
+  treeTrunks.count = placed;
+  treeCanopies.count = placed;
+  treeTrunks.instanceMatrix.needsUpdate = true;
+  treeCanopies.instanceMatrix.needsUpdate = true;
+
+  propsGroup.add(treeTrunks);
+  propsGroup.add(treeCanopies);
+}
+
+let cars = null;
+let carLights = null;
+let carData = [];
+
+function spawnCars() {
+  clearGroup(trafficGroup);
+
+  const bodyGeo = new THREE.BoxGeometry(2.4, 0.9, 4.2);
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0x6b7cff,
+    roughness: 0.55,
+    metalness: 0.15,
+    emissive: new THREE.Color(0x0a1020),
+    emissiveIntensity: 0.35,
+  });
+
+  const lightGeo = new THREE.BoxGeometry(0.35, 0.2, 0.18);
+  const lightMat = new THREE.MeshBasicMaterial({
+    color: 0xfff2cc,
+    transparent: true,
+    opacity: 0.95,
+  });
+
+  const count = 42;
+  cars = new THREE.InstancedMesh(bodyGeo, bodyMat, count);
+  carLights = new THREE.InstancedMesh(lightGeo, lightMat, count * 2);
+  cars.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  carLights.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+  carData = [];
+  const { spacing, halfW, halfD } = cityState;
+  const lanesZ = [-(spacing * 2.5), 0, spacing * 2.5];
+  const lanesX = [-(spacing * 2.5), spacing * 2.5];
+  const dummy = new THREE.Object3D();
+
+  for (let i = 0; i < count; i++) {
+    const alongZ = i % 2 === 0;
+    const laneOffset = alongZ ? lanesZ[i % lanesZ.length] : lanesX[i % lanesX.length];
+    const speed = (alongZ ? 14 : 12) + Math.random() * 10;
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    const t0 = Math.random();
+    const color = new THREE.Color().setHSL(0.55 + (Math.random() * 0.1 - 0.05), 0.55, 0.55);
+    cars.setColorAt(i, color);
+
+    carData.push({ alongZ, laneOffset, speed, dir, t0 });
+
+    // init matrices (updated in tick)
+    dummy.position.set(0, 0.5, 0);
+    dummy.rotation.y = 0;
+    dummy.updateMatrix();
+    cars.setMatrixAt(i, dummy.matrix);
+  }
+
+  cars.instanceColor.needsUpdate = true;
+  trafficGroup.add(cars);
+  trafficGroup.add(carLights);
+}
+
+const carDummy = new THREE.Object3D();
+const lightDummy = new THREE.Object3D();
+
+function updateCars(nowSec) {
+  if (!cars || !carLights) return;
+  const { halfW, halfD, spacing } = cityState;
+  const roadY = 0.03;
+  const roadSpanX = (halfW + spacing * 0.65);
+  const roadSpanZ = (halfD + spacing * 0.65);
+
+  let lightIndex = 0;
+
+  for (let i = 0; i < carData.length; i++) {
+    const c = carData[i];
+    const t = (c.t0 + nowSec * (c.speed / 120)) % 1;
+
+    if (c.alongZ) {
+      const z = lerp(-roadSpanZ, roadSpanZ, t) * c.dir;
+      const x = c.laneOffset;
+      carDummy.position.set(x, roadY + 0.45, z);
+      carDummy.rotation.y = c.dir > 0 ? 0 : Math.PI;
+    } else {
+      const x = lerp(-roadSpanX, roadSpanX, t) * c.dir;
+      const z = c.laneOffset;
+      carDummy.position.set(x, roadY + 0.45, z);
+      carDummy.rotation.y = c.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+    }
+
+    carDummy.updateMatrix();
+    cars.setMatrixAt(i, carDummy.matrix);
+
+    // headlight positions (front corners)
+    const forward = new THREE.Vector3(0, 0, 1).applyEuler(new THREE.Euler(0, carDummy.rotation.y, 0));
+    const right = new THREE.Vector3(1, 0, 0).applyEuler(new THREE.Euler(0, carDummy.rotation.y, 0));
+    const front = carDummy.position.clone().addScaledVector(forward, 2.15);
+
+    const leftPos = front.clone().addScaledVector(right, -0.65);
+    const rightPos = front.clone().addScaledVector(right, 0.65);
+
+    lightDummy.position.copy(leftPos).setY(roadY + 0.35);
+    lightDummy.rotation.y = carDummy.rotation.y;
+    lightDummy.updateMatrix();
+    carLights.setMatrixAt(lightIndex++, lightDummy.matrix);
+
+    lightDummy.position.copy(rightPos).setY(roadY + 0.35);
+    lightDummy.rotation.y = carDummy.rotation.y;
+    lightDummy.updateMatrix();
+    carLights.setMatrixAt(lightIndex++, lightDummy.matrix);
+  }
+
+  cars.instanceMatrix.needsUpdate = true;
+  carLights.count = lightIndex;
+  carLights.instanceMatrix.needsUpdate = true;
+}
+
+function spawnCityDressing() {
+  spawnRoads();
+  spawnTrees();
+  spawnCars();
+}
 
 function makeRng(seed) {
   let s = seed >>> 0;
@@ -433,6 +759,8 @@ function spawnCity({ rows = 18, cols = 18, spacing = 18 } = {}) {
   const halfW = (cols - 1) * spacing * 0.5;
   const halfD = (rows - 1) * spacing * 0.5;
 
+  cityState = { rows, cols, spacing, halfW, halfD };
+
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const x = c * spacing - halfW;
@@ -488,6 +816,7 @@ function spawnCity({ rows = 18, cols = 18, spacing = 18 } = {}) {
 }
 
 spawnCity();
+spawnCityDressing();
 
 function updateBuildingBox(b) {
   // Boxes are static unless we do destruction effects; recompute only on demand.
@@ -842,6 +1171,7 @@ function resetGame() {
   laserBeams.length = 0;
 
   spawnCity();
+  spawnCityDressing();
   beep({ type: 'triangle', freq: 320, dur: 0.06, gain: 0.04 });
 }
 
@@ -885,7 +1215,7 @@ function tick(now) {
     fwd.y = 0;
     if (fwd.lengthSq() > 0) fwd.normalize();
 
-    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), fwd).normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
 
     accel.set(0, 0, 0);
     accel.addScaledVector(fwd, forward);
@@ -923,6 +1253,9 @@ function tick(now) {
       camera.position.copy(baseCamLocalPos);
     }
   }
+
+  // traffic
+  updateCars(now / 1000);
 
   // update projectiles
   for (let i = projectiles.length - 1; i >= 0; i--) {
