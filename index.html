@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3Blast</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="hud" aria-live="polite">
+      <div class="hud-left">
+        <div class="hud-title">3Blast</div>
+        <div class="hud-row"><span class="k">Score</span> <span id="score">0</span></div>
+        <div class="hud-row"><span class="k">High</span> <span id="highScore">0</span></div>
+        <div class="hud-row"><span class="k">Weapon</span> <span id="weapon">Cannon</span></div>
+        <div class="hud-row"><span class="k">Tips</span> <span class="v">WASD move · Mouse look · Space/Shift up/down · 1/2/3 switch</span></div>
+      </div>
+      <div class="hud-right">
+        <div class="hud-row"><span class="k">FPS</span> <span id="fps">—</span></div>
+      </div>
+    </div>
+
+    <div id="center">
+      <div id="crosshair" aria-hidden="true"></div>
+    </div>
+
+    <div id="overlay" role="dialog" aria-modal="true">
+      <div class="panel">
+        <div class="panel-title">City Destruction</div>
+        <div class="panel-body">
+          <p>Fly around and destroy buildings to score points.</p>
+          <ul>
+            <li><b>Click</b> to lock mouse and start</li>
+            <li><b>Left click</b> fire · <b>1/2/3</b> switch weapons</li>
+            <li><b>R</b> reset city · <b>Esc</b> unlock mouse</li>
+          </ul>
+        </div>
+        <button id="startBtn" class="btn" type="button">Start</button>
+      </div>
+    </div>
+
+    <canvas id="c"></canvas>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
